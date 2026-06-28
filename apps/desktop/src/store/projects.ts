@@ -238,9 +238,12 @@ export async function refreshProjects(): Promise<void> {
   try {
     applyPayload(await gatewayRequest<ProjectsPayload>('projects.list'))
     markProjectsRpcSuccess()
-  } catch (err) {
+  } catch (err: unknown) {
     markProjectsRpcFailure(err)
-    // Backend may not be ready; keep the last known list.
+    // Backend may not be ready; keep the last known list. Log so a persistent
+    // failure (the bug that made the sidebar silently fall back to cwd grouping)
+    // is visible instead of swallowed.
+    console.warn('[hermes-projects] failed to refresh projects list', err)
   }
 }
 
@@ -279,9 +282,12 @@ export async function refreshProjectTree(): Promise<void> {
     }
 
     markProjectsRpcSuccess()
-  } catch (err) {
+  } catch (err: unknown) {
     markProjectsRpcFailure(err)
-    // Backend may not be ready; keep the last known tree.
+    // Backend may not be ready; keep the last known tree. Log persistent
+    // failures so the project overview cannot silently fall back to cwd grouping
+    // (the regression this guards against).
+    console.warn('[hermes-projects] failed to refresh project tree', err)
   } finally {
     $projectTreeLoading.set(false)
   }

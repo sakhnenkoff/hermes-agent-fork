@@ -8355,8 +8355,29 @@ def _resolve_update_branch(args) -> str:
     or whitespace-only values as the default" parsing so every consumer of
     ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
     the same answer.
+
+    Resolution order:
+      1. Explicit ``--branch NAME`` on the CLI (highest priority).
+      2. ``updates.branch`` in config.yaml — lets a fork pin its own stable
+         lane so bare ``hermes update`` (and the desktop Update button, which
+         shells out to the same path) follows the patched branch instead of
+         silently resetting to ``main`` and trampling local fixes.
+      3. ``main`` (upstream default, unchanged behavior for vanilla installs).
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    explicit = (getattr(args, "branch", None) or "").strip()
+    if explicit:
+        return explicit
+    try:
+        from hermes_cli.config import load_config
+
+        configured = (
+            (load_config().get("updates", {}) or {}).get("branch", "") or ""
+        ).strip()
+        if configured:
+            return configured
+    except Exception as e:  # fail-soft: never let config issues block updates
+        logger.debug("update branch: config resolution failed: %s", e)
+    return "main"
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):

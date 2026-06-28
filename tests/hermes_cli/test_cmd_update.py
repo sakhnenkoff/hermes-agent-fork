@@ -673,6 +673,72 @@ class TestCmdUpdateBranchFlag:
         assert "nonexistent" in out
 
 
+class TestResolveUpdateBranch:
+    """``_resolve_update_branch`` resolution order: --branch > config > main.
+
+    A fork that pins ``updates.branch`` in config.yaml needs bare
+    ``hermes update`` (and the desktop Update button, which shells out to the
+    same path) to follow that branch instead of silently resetting to
+    ``origin/main`` and trampling local commits.
+    """
+
+    def test_explicit_branch_wins(self):
+        from hermes_cli import main as hm
+
+        args = SimpleNamespace(branch="feature/x")
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"updates": {"branch": "matvii/stable"}},
+        ):
+            assert hm._resolve_update_branch(args) == "feature/x"
+
+    def test_config_branch_used_when_flag_absent(self):
+        from hermes_cli import main as hm
+
+        args = SimpleNamespace(branch=None)
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"updates": {"branch": "matvii/stable"}},
+        ):
+            assert hm._resolve_update_branch(args) == "matvii/stable"
+
+    def test_defaults_to_main_without_flag_or_config(self):
+        from hermes_cli import main as hm
+
+        args = SimpleNamespace(branch=None)
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert hm._resolve_update_branch(args) == "main"
+
+    def test_empty_config_branch_falls_through_to_main(self):
+        from hermes_cli import main as hm
+
+        args = SimpleNamespace(branch=None)
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"updates": {"branch": "   "}},
+        ):
+            assert hm._resolve_update_branch(args) == "main"
+
+    def test_whitespace_flag_falls_through_to_config(self):
+        from hermes_cli import main as hm
+
+        args = SimpleNamespace(branch="  ")
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"updates": {"branch": "matvii/stable"}},
+        ):
+            assert hm._resolve_update_branch(args) == "matvii/stable"
+
+    def test_config_load_failure_falls_back_to_main(self):
+        from hermes_cli import main as hm
+
+        args = SimpleNamespace(branch=None)
+        with patch(
+            "hermes_cli.config.load_config", side_effect=RuntimeError("boom")
+        ):
+            assert hm._resolve_update_branch(args) == "main"
+
+
 class TestCmdUpdateCheckBranchFlag:
     """``hermes update --check --branch <name>`` honors the branch override.
 

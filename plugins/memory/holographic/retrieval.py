@@ -7,6 +7,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -62,8 +63,12 @@ class FactRetriever:
 
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         """
-        # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
-        candidates = self._fts_candidates(query, category, min_trust, limit * 3)
+        # Stage 1: Get FTS5 candidates (more than limit for reranking headroom).
+        # OR-token FTS is high-recall, so give the reranker a wider bounded pool
+        # instead of limit*3 — otherwise common tokens can crowd out the right
+        # fact before Jaccard/trust/HRR precision runs.
+        candidate_pool = min(max(limit * 10, 50), 150)
+        candidates = self._fts_candidates(query, category, min_trust, candidate_pool)
 
         if not candidates:
             return []
@@ -109,6 +114,8 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+        # Learning signal: bump retrieval_count on the facts we actually return.
+        self._mark_retrieved(results)
         return results
 
     def probe(
@@ -492,15 +499,20 @@ class FactRetriever:
         """
         conn = self.store._conn
 
+        # Convert the raw natural-language query into a high-recall FTS5 MATCH.
+        # Raw MATCH treats whitespace as implicit AND (all words must appear in
+        # ONE fact -> frequent 0-result misses) and errors on hyphens/punctuation.
+        # We OR quoted normalized tokens for candidate generation; the downstream
+        # Jaccard + trust + HRR rerank handles precision.
+        match_query = self._build_fts_match(query)
+        if not match_query:
+            return []
+
         # Build query - FTS5 rank is negative (lower = better match)
         # We need to join facts_fts with facts to get all columns
         params: list = []
         where_clauses = ["facts_fts MATCH ?"]
-        # FTS5 defaults to AND-between-tokens, which kills recall on
-        # natural-language queries ("what happened with the deployment
-        # rollback"). Sanitize: drop stopwords, OR-join content tokens, so
-        # any significant term can match.
-        params.append(self._sanitize_fts_query(query))
+        params.append(match_query)
 
         if category:
             where_clauses.append("f.category = ?")
@@ -545,6 +557,91 @@ class FactRetriever:
 
         return results
 
+    _FTS_STOPWORDS = frozenset({
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "do", "for",
+        "from", "how", "i", "if", "in", "is", "it", "me", "my", "no", "not",
+        "of", "on", "or", "our", "so", "that", "the", "their", "them", "then",
+        "there", "this", "to", "was", "we", "what", "when", "where", "which",
+        "who", "why", "will", "with", "you", "your",
+        "about", "current", "currently", "status", "summary", "info",
+    })
+
+    @classmethod
+    def _build_fts_match(cls, query: str, max_terms: int = 16) -> str:
+        """Turn natural-language text into a safe high-recall FTS5 MATCH string.
+
+        Raw FTS5 MATCH treats whitespace as implicit AND and errors on
+        hyphens / punctuation, so multi-word NL queries frequently return 0
+        rows. We extract word tokens, drop stopwords, dedupe, quote each token
+        (quoting neutralizes FTS operators), and OR them for broad candidate
+        generation. Precision is restored downstream by the Jaccard + trust +
+        HRR rerank in search(). Returns '' when nothing usable remains.
+        """
+        seen: set[str] = set()
+        terms: list[str] = []
+        for raw in re.findall(r"\w+", (query or "").lower()):
+            if len(raw) < 2 or raw in cls._FTS_STOPWORDS or raw in seen:
+                continue
+            seen.add(raw)
+            terms.append(raw)
+            if len(terms) >= max_terms:
+                break
+        # Fallback: if stopword filtering nuked everything (e.g. a 1-word query
+        # that is itself a stopword), keep any word tokens so we still search.
+        if not terms:
+            for raw in re.findall(r"\w+", (query or "").lower()):
+                if len(raw) >= 2 and raw not in seen:
+                    seen.add(raw)
+                    terms.append(raw)
+                if len(terms) >= max_terms:
+                    break
+        # Tokens come from \w+ so quoting is safe and avoids FTS syntax surprises.
+        return " OR ".join(f'"{t}"' for t in terms)
+
+    @classmethod
+    def _sanitize_fts_query(cls, query: str) -> str:
+        """Upstream-compatible name for the FTS5 sanitizer.
+
+        Upstream Hermes ships this helper as ``_sanitize_fts_query``; our
+        local implementation is ``_build_fts_match`` (wider stopword list +
+        max_terms cap). This thin wrapper keeps both call sites working and
+        minimizes merge friction when the upstream fix eventually lands.
+        """
+        return cls._build_fts_match(query)
+
+    def _mark_retrieved(self, results: list[dict]) -> None:
+        """Best-effort retrieval_count increment for the FINAL returned facts.
+
+        This is the learning signal: facts that actually surface get used-counts
+        so trust/ranking can evolve. Metric failures must NEVER break recall,
+        and updated_at is deliberately left untouched (usage != content change).
+        """
+        ids = [int(r["fact_id"]) for r in results if r.get("fact_id") is not None]
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        try:
+            conn = self.store._conn
+            lock = getattr(self.store, "_lock", None)
+            if lock is not None:
+                with lock:
+                    conn.execute(
+                        f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                        f"WHERE fact_id IN ({placeholders})",
+                        ids,
+                    )
+                    conn.commit()
+            else:
+                conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                    f"WHERE fact_id IN ({placeholders})",
+                    ids,
+                )
+                conn.commit()
+        except Exception:
+            # Metrics are best-effort; never let them break recall.
+            return
+
     @staticmethod
     def _tokenize(text: str) -> set[str]:
         """Simple whitespace tokenization with lowercasing.
@@ -581,42 +678,6 @@ class FactRetriever:
         "which", "while", "who", "whom", "why", "will", "with", "would",
         "you", "your", "yours", "yourself", "yourselves",
     })
-
-    @classmethod
-    def _sanitize_fts_query(cls, query: str) -> str:
-        """Convert a natural-language query to an FTS5-safe OR expression.
-
-        FTS5 treats a multi-word MATCH argument as AND-joined by default,
-        which tanks recall on prose queries. This helper:
-          - tokenizes the query
-          - drops stopwords and short (<2 char) tokens
-          - strips FTS5 special characters from each token
-          - OR-joins the survivors
-
-        If nothing remains (pathological query), falls back to the raw
-        query so the caller sees zero results instead of a SQL error.
-        """
-        if not query:
-            return ""
-        # Strip FTS5 operator characters from EACH token to avoid
-        # accidentally creating a malformed query.
-        _FTS_SPECIAL = '"()*^:-+'
-        tokens: list[str] = []
-        for raw in query.lower().split():
-            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>") .translate(
-                str.maketrans("", "", _FTS_SPECIAL)
-            )
-            if len(cleaned) < 2:
-                continue
-            if cleaned in cls._FTS_STOPWORDS:
-                continue
-            # FTS5 phrase-literal each token to ensure no special chars
-            # sneak through as operators.
-            tokens.append(f'"{cleaned}"')
-        if not tokens:
-            # Fallback: raw query (likely returns 0, but never crashes)
-            return query
-        return " OR ".join(tokens)
 
     @staticmethod
     def _jaccard_similarity(set_a: set, set_b: set) -> float:

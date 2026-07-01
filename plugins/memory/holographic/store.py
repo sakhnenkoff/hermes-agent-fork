@@ -206,12 +206,20 @@ class MemoryStore:
                 return []
 
             # FTS5 AND-joins tokens by default, which zeroes out recall on
-            # natural-language queries. Reuse the retriever's sanitizer
-            # (stopword drop + OR-join content tokens). Imported lazily to
-            # avoid a store->retrieval import cycle.
+            # natural-language queries. Route through the retriever's sanitizer
+            # (stopword drop + OR-join quoted content tokens). Imported lazily
+            # to avoid a store->retrieval import cycle. An empty result means
+            # the query had no usable word tokens (punctuation/operator-only
+            # input like "!!!") — return [] rather than handing FTS5 an empty
+            # MATCH, which raises a syntax error. Note: an all-stopword query
+            # still yields tokens (the sanitizer falls back to raw words), so
+            # it searches normally rather than short-circuiting here.
             from plugins.memory.holographic.retrieval import FactRetriever
 
-            match_query = FactRetriever._sanitize_fts_query(query)
+            match_query = FactRetriever._build_fts_match(query)
+            if not match_query:
+                return []
+
             params: list = [match_query, min_trust]
             category_clause = ""
             if category is not None:

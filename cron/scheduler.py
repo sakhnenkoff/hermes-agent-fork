@@ -1881,6 +1881,56 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _prepend_path_entries(env: dict, entries: list) -> None:
+    """Prepend *entries* to env['PATH'], expanded and de-duplicated, preserving order."""
+    current = env.get("PATH") or os.defpath
+    parts: list = []
+    seen: set = set()
+    for raw in [*entries, *current.split(os.pathsep)]:
+        if not raw:
+            continue
+        p = os.path.expanduser(os.path.expandvars(str(raw)))
+        key = os.path.normcase(os.path.normpath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(p)
+    env["PATH"] = os.pathsep.join(parts)
+
+
+def _build_script_subprocess_env() -> dict:
+    """Sanitized env for no_agent cron scripts, with a GUARANTEED tool PATH.
+
+    Class-wide fix (2026-07-01): no_agent scripts run under WHICHEVER process wins
+    the cron tick lock — the launchd gateway (rich PATH) OR the desktop Hermes.app
+    dashboard backend, which inherits Finder's minimal GUI PATH
+    (/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin) where `node`/`npx` are absent and
+    `python3` is Xcode's stale bundled interpreter. A script shelling out to a bare
+    `node`/`npx`/`brew`/`gh`/`python3` then dies with FileNotFoundError. We keep the
+    security-critical secret stripping (`_sanitize_subprocess_env`) but ALWAYS prepend
+    the canonical Hermes tool dirs so ambient PATH can never break a cron script again.
+    """
+    from tools.environments.local import _sanitize_subprocess_env
+
+    env = _sanitize_subprocess_env(os.environ.copy())
+    if sys.platform != "win32":
+        hermes_home = Path(get_hermes_home()).expanduser()
+        real_home = Path(
+            env.get("HERMES_REAL_HOME") or env.get("HOME") or str(Path.home())
+        ).expanduser()
+        _prepend_path_entries(env, [
+            str(hermes_home / "hermes-agent" / "venv" / "bin"),        # python3 -> venv 3.11
+            str(hermes_home / "hermes-agent" / "node_modules" / ".bin"),
+            str(hermes_home / "node" / "bin"),                          # node/npx/npm v22
+            str(real_home / ".local" / "bin"),
+            str(real_home / ".bun" / "bin"),
+            "/opt/homebrew/bin", "/opt/homebrew/sbin",
+            "/usr/local/bin", "/usr/local/sbin",
+            "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        ])
+    return env
+
+
 def _get_script_timeout() -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
     if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
@@ -1972,18 +2022,22 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     script_timeout = _get_script_timeout()
 
+    # Build the sanitized, PATH-hardened env FIRST so interpreter resolution below
+    # uses the same guaranteed tool PATH the script itself will run under (class fix
+    # 2026-07-01 — see _build_script_subprocess_env).
+    script_env = _build_script_subprocess_env()
+
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
     if suffix in {".sh", ".bash"}:
-        # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
-        # all work.  On native Windows without Git for Windows installed
-        # shutil.which returns None — fall back to a clear error rather
-        # than a FileNotFoundError with a confusing "[WinError 2]"
-        # traceback.
-        _bash = shutil.which("bash") or (
+        # Resolve bash via the HARDENED PATH so Windows (Git Bash) and Linux/macOS
+        # all work, and the desktop-ticker stripped GUI PATH can't miss it.
+        # On native Windows without Git for Windows shutil.which returns None —
+        # fall back to a clear error rather than a confusing "[WinError 2]".
+        _bash = shutil.which("bash", path=script_env.get("PATH")) or (
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
         if _bash is None:
@@ -1994,11 +2048,13 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             )
         argv = [_bash, str(path)]
     else:
-        argv = [sys.executable, str(path)]
+        # Prefer the Hermes venv python3 (resolved via the hardened PATH) so a
+        # stripped-PATH runner can never fall through to Xcode's stale python3.9.
+        # Fall back to the current interpreter if resolution somehow fails.
+        _py = shutil.which("python3", path=script_env.get("PATH")) or sys.executable
+        argv = [_py, str(path)]
 
     try:
-        from tools.environments.local import _sanitize_subprocess_env
-
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(
             argv,
@@ -2006,7 +2062,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=script_env,
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()

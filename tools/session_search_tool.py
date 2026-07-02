@@ -31,6 +31,7 @@ support.
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, Union
 
 # Sources that are excluded from session browsing/searching by default.
@@ -54,6 +55,74 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
+
+# Hard ceiling on how many FTS rows discover will page through when the top
+# rows are dominated by the CURRENT session's own lineage (which is filtered
+# out post-fetch). Without pagination, searching from a session that actively
+# discusses the query terms returns zero results — this session's matches fill
+# the first page, get excluded, and the wrapper never looks deeper (the
+# "current-lineage starvation" bug). Paginate until enough distinct non-current
+# lineages are found or this cap is hit.
+_DISCOVER_MAX_SCAN_ROWS = 3000
+
+# Stopwords stripped before building a relaxed (OR) recall fallback. A natural-
+# language recall query ("book github repo extracted agents architecture") is
+# fed to FTS5 as strict-AND by search_messages, so the ONLY lineage holding
+# every token is often the current session itself — which _discover filters out,
+# yielding zero. When strict AND finds no non-current lineage, we relax to an OR
+# of the meaningful tokens and re-rank by term overlap. Trigger is conditional
+# (strict-first), so precise queries that already work are never degraded.
+_RELAXED_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "was", "were", "you",
+    "your", "where", "when", "what", "some", "time", "ago", "from",
+    "about", "into", "there", "somewhere", "sometime", "did", "does",
+    "are", "our", "have", "has", "had", "get", "got", "can", "could",
+    "would", "should", "just", "like", "mean", "talking", "talked",
+})
+
+# Cap on how many distinct tokens feed the relaxed OR query, so a long recall
+# sentence can't build a pathological MATCH.
+_RELAXED_MAX_TERMS = 12
+
+# Minimum distinct non-current lineages the relaxed OR fallback pages for, so
+# overlap re-ranking has a real candidate pool instead of stopping on the first
+# few weak OR hits (which can bury the best-matching lineage).
+_RELAXED_SCAN_TARGET_MIN = 100
+
+
+def _relaxed_recall_terms(query: str) -> List[str]:
+    """Extract deduped, stopword-stripped alphanumeric tokens (>=2 chars) for a
+    relaxed OR recall query. Order-preserving, capped at _RELAXED_MAX_TERMS."""
+    terms: List[str] = []
+    seen = set()
+    for tok in re.findall(r"[A-Za-z0-9]{2,}", query.lower()):
+        if tok in _RELAXED_STOPWORDS or tok in seen:
+            continue
+        seen.add(tok)
+        terms.append(tok)
+        if len(terms) >= _RELAXED_MAX_TERMS:
+            break
+    return terms
+
+
+def _build_relaxed_recall_query(terms: List[str]) -> Optional[str]:
+    """OR-join quoted tokens. Requires >=2 meaningful terms so a single-word
+    query (already handled fine by strict search) never triggers the fallback."""
+    if len(terms) < 2:
+        return None
+    return " OR ".join(f'"{t}"' for t in terms)
+
+
+def _relaxed_overlap_score(row: Dict[str, Any], terms: List[str]) -> int:
+    """How many of the query's meaningful terms appear in a row's text. Used to
+    re-rank relaxed OR results so the closest matches surface first (a bare OR
+    otherwise returns BM25 order that can bury the best lineage)."""
+    haystack = " ".join(
+        str(row.get(k) or "")
+        for k in ("content", "snippet", "title", "session_title", "session_id")
+    ).lower()
+    text_terms = set(re.findall(r"[a-z0-9]{2,}", haystack))
+    return sum(1 for t in terms if t in text_terms)
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -509,17 +578,85 @@ def _discover(
     current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
     title_result = _title_match_result(db, query, current_lineage_root)
 
+    # Cache lineage-root resolution so the pagination candidate loop and the
+    # final dedupe loop don't re-issue get_session() walks for the same sid.
+    # With _DISCOVER_MAX_SCAN_ROWS up to 3000 this bounds SQLite lookups to one
+    # per distinct session rather than one per row per page.
+    _lineage_cache: Dict[str, str] = {}
+
+    def _resolve_lineage(raw_sid: str) -> str:
+        cached = _lineage_cache.get(raw_sid)
+        if cached is None:
+            cached = _resolve_to_parent(db, raw_sid)
+            _lineage_cache[raw_sid] = cached
+        return cached
+
+    def _fetch_rows(search_query: str, target: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Bounded FTS pagination. Pages until `target` distinct non-current
+        lineages are found, rows run out, or the scan ceiling is hit — so the
+        current session's own matches can't starve recall. `target` defaults to
+        `limit`; the relaxed fallback passes a wider pool so overlap-ranking has
+        real candidates instead of stopping on the first weak OR hits."""
+        want = target if target is not None else limit
+        rows: List[Dict[str, Any]] = []
+        offset = 0
+        scanned = 0
+        while scanned < _DISCOVER_MAX_SCAN_ROWS:
+            page_limit = min(_DISCOVER_SCAN_LIMIT, _DISCOVER_MAX_SCAN_ROWS - scanned)
+            page = db.search_messages(
+                query=search_query,
+                role_filter=role_list,
+                exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                limit=page_limit,
+                offset=offset,
+                sort=sort,
+            )
+            if not page:
+                break
+            rows.extend(page)
+            scanned += len(page)
+            offset += len(page)
+            if len(_qualifying_lineages(rows)) >= want or len(page) < page_limit:
+                break
+        return rows
+
+    def _qualifying_lineages(rows: List[Dict[str, Any]]) -> set:
+        """Distinct lineage roots that survive the current-lineage exclusion."""
+        out = set()
+        for r in rows:
+            raw_sid = r.get("session_id")
+            if not raw_sid:
+                continue
+            resolved_sid = _resolve_lineage(raw_sid)
+            if current_lineage_root and resolved_sid == current_lineage_root:
+                continue
+            if current_session_id and raw_sid == current_session_id:
+                continue
+            out.add(resolved_sid)
+        return out
+
     try:
-        raw_results = db.search_messages(
-            query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
-            # distinct sessions AND so interactive matches buried under a wall
-            # of cron rows are still in hand for the demotion pass below.
-            offset=0,
-            sort=sort,
-        )
+        raw_results = _fetch_rows(query)
+
+        # Relaxed fallback (conditional): natural-language recall queries are
+        # fed to FTS5 as strict-AND, so when every token co-occurs only in the
+        # CURRENT session (filtered out) strict search returns zero non-current
+        # lineages. ONLY then, relax to an OR of meaningful tokens and re-rank
+        # by term overlap. Precise queries that already match are untouched.
+        if not _qualifying_lineages(raw_results) and not title_result:
+            relaxed_terms = _relaxed_recall_terms(query)
+            relaxed_query = _build_relaxed_recall_query(relaxed_terms)
+            if relaxed_query:
+                relaxed_results = _fetch_rows(
+                    relaxed_query,
+                    target=max(limit * 20, _RELAXED_SCAN_TARGET_MIN),
+                )
+                if _qualifying_lineages(relaxed_results):
+                    raw_results = sorted(
+                        relaxed_results,
+                        key=lambda r: _relaxed_overlap_score(r, relaxed_terms),
+                        reverse=True,
+                    )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
@@ -556,7 +693,7 @@ def _discover(
         if len(seen_sessions) >= limit:
             break
         raw_sid = r["session_id"]
-        resolved_sid = _resolve_to_parent(db, raw_sid)
+        resolved_sid = _resolve_lineage(raw_sid)
         # Skip the current session lineage
         if current_lineage_root and resolved_sid == current_lineage_root:
             continue

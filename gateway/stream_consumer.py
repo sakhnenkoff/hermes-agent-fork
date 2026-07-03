@@ -156,6 +156,9 @@ class GatewayStreamConsumer:
         self._initial_reply_to_id = initial_reply_to_id
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
+        # Bounded backoff before retrying a single overflow chunk that failed
+        # with a retryable (flood/rate-limit) error. Tests set this to 0.0.
+        self._chunk_retry_delay = 0.5
         self._message_id: Optional[str] = None
         # Wall-clock timestamp (time.monotonic) when ``_message_id`` was
         # first assigned from a successful first-send.  Used by the
@@ -723,27 +726,64 @@ class GatewayStreamConsumer:
                         chunks = self.adapter.truncate_message(
                             self._accumulated, _safe_limit, len_fn=_len_fn,
                         )
-                        chunks_delivered = False
+                        # Delivery is complete only when EVERY chunk lands.
+                        # The previous "any chunk landed = delivered" logic
+                        # marked the turn done when chunk 1 sent and a later
+                        # chunk was throttled/rejected, silently dropping the
+                        # tail (invisible to the streaming on/off toggle).
+                        chunks_delivered = True
                         reply_to = self._message_id or self._initial_reply_to_id
-                        for chunk in chunks:
-                            new_id = await self._send_new_chunk(
-                                chunk,
-                                reply_to,
-                                final=got_done,
+                        for _idx, chunk in enumerate(chunks):
+                            ok, _new_id, retryable = (
+                                await self._send_new_chunk_result(
+                                    chunk, reply_to, final=got_done,
+                                )
                             )
-                            if new_id is not None and new_id != reply_to:
-                                chunks_delivered = True
-                        self._accumulated = ""
-                        self._last_sent_text = ""
+                            if not ok and retryable:
+                                # One bounded retry of the SAME chunk (never
+                                # restart from the head — that would duplicate
+                                # already-visible content). Reuse the fallback
+                                # backoff so a real flood limit gets a beat.
+                                if self._chunk_retry_delay > 0:
+                                    await asyncio.sleep(self._chunk_retry_delay)
+                                ok, _new_id, retryable = (
+                                    await self._send_new_chunk_result(
+                                        chunk, reply_to, final=got_done,
+                                    )
+                                )
+                            if not ok:
+                                # Stop on the first failed chunk: continuing
+                                # would leave a visible gap / out-of-order
+                                # chunks. Leave the tail unsent.
+                                chunks_delivered = False
+                                logger.warning(
+                                    "Stream overflow delivery incomplete: "
+                                    "%s/%s chunks delivered before failure",
+                                    _idx, len(chunks),
+                                )
+                                break
+                        if chunks_delivered:
+                            self._accumulated = ""
+                            self._last_sent_text = ""
+                        # On partial failure, DELIBERATELY preserve
+                        # _accumulated and leave the final flags false. The
+                        # outer gateway final-send path (run.py) delivers the
+                        # full answer from response["final_response"] because
+                        # delivery was not confirmed here — worst case the
+                        # complete reply is resent, never silently truncated.
                         self._last_edit_time = time.monotonic()
                         if got_done:
-                            # Only claim final delivery if THESE chunks actually
-                            # landed.  ``_already_sent`` may be True from prior
-                            # tool-progress edits or fallback-mode promotion (#10748)
-                            # — that doesn't mean the final answer reached the user.
+                            # Only claim final delivery if ALL chunks landed.
+                            # ``_already_sent`` may be True from prior
+                            # tool-progress edits or fallback-mode promotion
+                            # (#10748) — that doesn't mean the final answer
+                            # reached the user.
                             self._final_response_sent = chunks_delivered
-                            if chunks_delivered:
-                                self._final_content_delivered = True
+                            # Explicitly mirror onto _final_content_delivered
+                            # (both directions): a stale True from a prior
+                            # segment must not let run.py suppress the
+                            # authoritative final send on partial failure.
+                            self._final_content_delivered = chunks_delivered
                             return
                         if got_segment_break:
                             self._message_id = None
@@ -1005,10 +1045,35 @@ class GatewayStreamConsumer:
         """Send a new message chunk, optionally threaded to a previous message.
 
         Returns the message_id so callers can thread subsequent chunks.
+        Compatibility wrapper around :meth:`_send_new_chunk_result` — callers
+        that only need the id (and can't distinguish success from failure)
+        keep working; delivery-accounting callers use the richer result form.
+        """
+        _ok, msg_id, _retryable = await self._send_new_chunk_result(
+            text, reply_to_id, final=final,
+        )
+        return msg_id
+
+    async def _send_new_chunk_result(
+        self,
+        text: str,
+        reply_to_id: Optional[str],
+        *,
+        final: bool = False,
+    ) -> "tuple[bool, Optional[str], bool]":
+        """Send a new message chunk and report the outcome unambiguously.
+
+        Returns ``(ok, message_id_or_reply_to, retryable)``.  ``ok`` is True
+        only when the platform confirmed delivery with a real message id — the
+        previous id-only contract returned ``reply_to_id`` on failure, which
+        made a throttled send indistinguishable from a successful one and let
+        the overflow chunk loop mark a turn delivered on partial success.
         """
         text = self._clean_for_display(text)
         if not text.strip():
-            return reply_to_id
+            # Nothing to send — treat as a no-op success so empty trailing
+            # chunks don't fail the all-chunks-delivered contract.
+            return True, reply_to_id, False
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
@@ -1024,13 +1089,20 @@ class GatewayStreamConsumer:
                 # Fresh content bubble — close off any stale tool bubble
                 # above so the next tool starts a new bubble below.
                 self._notify_new_message()
-                return str(result.message_id)
+                return True, str(result.message_id), False
             else:
                 self._edit_supported = False
-                return reply_to_id
+                retryable = bool(
+                    getattr(result, "retryable", False)
+                    or self._is_flood_error(result)
+                )
+                return False, reply_to_id, retryable
         except Exception as e:
             logger.error("Stream send chunk error: %s", e)
-            return reply_to_id
+            # An exception is ambiguous (the platform may or may not have
+            # accepted the message); do not blind-retry — treat as
+            # non-retryable so the outer gateway final-send path recovers.
+            return False, reply_to_id, False
 
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""

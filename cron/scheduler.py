@@ -3616,6 +3616,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
+            # Per-job opt-out for noisy failure alerts (matvii/stable fork).
+            # Some jobs are prone to transient provider hiccups (empty streamed
+            # response, proxy hang) that self-heal on the next tick. When
+            # ``suppress_failure_alerts`` is set, a failed run is still saved to
+            # the cron output dir and still recorded as last_status=error via
+            # mark_job_run below — we just don't spam the delivery channel.
+            if should_deliver and not success and job.get("suppress_failure_alerts"):
+                logger.info(
+                    "Job '%s': suppress_failure_alerts set — skipping failure delivery",
+                    job["id"],
+                )
+                should_deliver = False
+
             if should_deliver:
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)

@@ -89,15 +89,44 @@ def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
 
 
 def test_run_one_job_failed_job_delivers_error(monkeypatch):
-    """A failed job still delivers (the error notice) and marks not-ok."""
+    """A failed job still delivers (the error notice) and marks not-ok.
+
+    This is the CONTROL for the ``suppress_failure_alerts`` opt-out below:
+    ordinary failures (no opt-out flag) MUST still deliver their error notice.
+    """
     calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
 
     s.run_one_job({"id": "j5", "name": "t"})
 
     kinds = [c[0] for c in calls]
-    assert "deliver" in kinds  # failures always deliver
+    assert "deliver" in kinds  # failures deliver unless suppress_failure_alerts is set
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j5", False)
+
+
+def test_run_one_job_suppress_failure_alerts_skips_delivery(monkeypatch):
+    """matvii/stable fork: a failed job with ``suppress_failure_alerts`` set
+    still SAVES output and marks the run failed, but does NOT deliver the
+    failure notice to the channel (mutes transient-hiccup spam).
+
+    Contract, asserted against the control above:
+    - save runs (output persisted)
+    - mark runs with ok=False (still recorded as an error / last_status=error)
+    - deliver does NOT run (the whole point of the opt-out)
+    - run_one_job still returns True — it reports the job was PROCESSED, not that
+      the job succeeded; the opt-out mutes the delivery ping, not the failure
+      record (mark_job_run above carries ok=False).
+    """
+    calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
+
+    ok = s.run_one_job({"id": "j5s", "name": "t", "suppress_failure_alerts": True})
+
+    kinds = [c[0] for c in calls]
+    assert "save" in kinds          # output still persisted
+    assert "deliver" not in kinds   # failure ping muted
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "j5s", False)  # still recorded as a failure
+    assert ok is True  # processed (not raised); job-level failure lives in mark_job_run
 
 
 def test_run_one_job_exception_marks_failure(monkeypatch):
